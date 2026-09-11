@@ -1,0 +1,24 @@
+[project]
+name = "dual-view-tracker"
+version = "0.1.0"
+description = "Track people in 3D with two ordinary webcams"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "opencv-python>=4.10,<5",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dual_view_tracker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

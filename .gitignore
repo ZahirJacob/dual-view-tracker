@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+*.local.*
+
+# Recordings, measurements and generated output
+recordings/
+output/
+*.mp4
+*.avi
+*.mkv
