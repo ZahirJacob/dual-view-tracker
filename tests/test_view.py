@@ -75,6 +75,7 @@ def test_parse_args_defaults_and_resolutions():
     args = parse_args(["--res0", "640X480", "--cam1", "2"])
     assert args.res0 == (640, 480)
     assert args.cam1 == 2
+    assert parse_args(["--cam1", "http://x:4747/video"]).cam1 == "http://x:4747/video"
     with pytest.raises(SystemExit):
         parse_args(["--res0", "wide"])
 
@@ -107,3 +108,14 @@ def test_offsets_csv_header_states_sign_convention(tmp_path):
         "1,0.004000",
         "2,-0.006100",
     ]
+
+
+def test_rise_summary_reports_largest_rise_per_camera():
+    cam0 = FakeStream(sequence([1.0, 1.033, 1.066], bright_from=2))
+    cam1 = FakeStream(sequence([1.0, 1.033, 1.066], bright_from=99))
+    trial = FlashTrial([cam0, cam1], duration=3.0, started_at=1.0, min_jump=20.0)
+    trial.collect()
+    summary = trial.rise_summary()
+    assert summary.startswith("largest rise (need 20)")
+    assert "cam0 rise 180.0 in 3 frames" in summary
+    assert "cam1 rise 0.0 in 3 frames" in summary

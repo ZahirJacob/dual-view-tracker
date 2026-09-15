@@ -20,12 +20,17 @@ class Frame:
 
 @dataclass(frozen=True)
 class CameraConfig:
-    device: int
+    device: int | str  # local device index, or a video stream URL
     width: int
     height: int
     fps: int = 30
     backend: int = cv2.CAP_MSMF
     fourcc: str = "MJPG"
+
+
+def parse_source(text: str) -> int | str:
+    """Digits-only text is a device index; anything else is a stream URL."""
+    return int(text) if text.isdigit() else text
 
 
 def decode_fourcc(value: float) -> str:
@@ -65,19 +70,25 @@ class CameraStream:
         self.settings: dict = {}
 
     def start(self) -> None:
+        source = self.config.device
+        is_stream = isinstance(source, str)
         if self._capture is None:
-            self._capture = cv2.VideoCapture(self.config.device, self.config.backend)
+            backend = cv2.CAP_FFMPEG if is_stream else self.config.backend
+            self._capture = cv2.VideoCapture(source, backend)
         if not self._capture.isOpened():
-            raise RuntimeError(f"cannot open camera device {self.config.device}")
+            raise RuntimeError(f"cannot open camera source {source}")
         cap = self._capture
-        # fourcc first: MJPG is what unlocks the high resolutions at full rate
-        # on most UVC webcams, and some drivers reject the size until it is set.
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.config.fourcc))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
-        cap.set(cv2.CAP_PROP_FPS, self.config.fps)
-        # Smallest driver queue so a grab returns the freshest frame; not all
-        # backends honour this, and that is fine.
+        if not is_stream:
+            # fourcc first: MJPG is what unlocks the high resolutions at full
+            # rate on most UVC webcams, and some drivers reject the size until
+            # it is set. A stream's format is decided by the remote side, so
+            # nothing is requested for it.
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.config.fourcc))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+            cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+        # Smallest queue so a grab returns the freshest frame; FFmpeg queues
+        # stream frames too. Not all backends honour this, and that is fine.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         # Read the negotiated settings once here; cap.get() from another
         # thread while the capture thread sits in grab() is not safe on MSMF.
