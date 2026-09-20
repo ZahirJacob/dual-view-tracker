@@ -8,7 +8,7 @@ The plan: detect body keypoints in each camera, match the detections across view
 
 ## Current status
 
-Two-camera capture with timestamps, frame pairing and a flash-based synchronization test. No calibration or pose estimation yet.
+Two-camera capture with timestamps, frame pairing and a flash-based synchronization test, manual or automated with a phone's LED torch. No calibration or pose estimation yet.
 
 ## Requirements
 
@@ -54,11 +54,29 @@ On start, the viewer prints the requested and actual settings of each camera. Th
 
 Webcams cannot be synchronized in hardware, so the viewer measures how far apart the two cameras are in time. Point a phone flash so both cameras see it, press `f`, and fire the flash within three seconds. The viewer finds the frame where brightness jumps in each camera and reports the difference (camera 1 minus camera 0, so a positive value means camera 1 saw the flash later). If the rise is smaller than `--min-jump` on either camera, the trial is discarded; each trial prints the largest rise seen per camera, so a missed flash can be diagnosed. Repeat a few times; the mean and spread are shown on screen, printed on exit, and written to `output/flash_offsets.csv` if at least one trial succeeded.
 
+#### Automated batch
+
+If the phone camera runs DroidCam, the viewer can drive the phone's LED torch through the DroidCam remote-control API and run the trials by itself. Pass `--remote` with the phone's remote-control address and press `t`:
+
+```powershell
+python -m dual_view_tracker.view --cam0 0 --cam1 http://192.168.0.20:4747/video --remote http://192.168.0.20:4747
+```
+
+A batch runs `--trials` flashes (20 by default). The torch is switched on, the phone's exposure is locked while lit so it keeps its full frame rate in a dim room, and then the torch is pulsed once per trial while both cameras record the brightness onset. The offset is camera 1 onset minus camera 0 onset, as in the manual test. Each trial prints its offset, the frame rate and largest rise per camera, and the frames missed; a trial where either camera dropped below 27 FPS is flagged `[slow]` and left out of the summary statistics, but kept in the CSV. On exit the summary is printed and every trial is written to `output/torch_offsets.csv`.
+
+Practical notes:
+
+- Both cameras must see the surface the torch lights, from within about a metre.
+- Keep the room dim and stay still during the batch.
+- The DroidCam remote API only offers toggles and does not report whether the torch or the exposure lock is on, so the viewer tracks that state itself. Start with the torch off and the exposure unlocked; the batch leaves the phone that way when it ends.
+- Close the DroidCam PC client: the phone accepts one connection.
+
 ## How it works
 
 - `capture.py` reads each camera in its own thread and keeps the last half second of frames, each stamped with its arrival time. A stream URL is read through FFmpeg.
 - `sync.py` pairs the newest frame of the reference camera with the closest frame of the other camera. It waits until the other camera has a frame at or after the reference frame, so no later frame can be a better match. This costs at most one frame period of latency. If the other camera stalls for longer than `--max-wait`, the pair is made anyway and marked unsettled.
 - `flash.py` finds the flash onset as the largest brightness rise between consecutive frames.
+- `trials.py` runs the manual trial and the torch batch as step machines driven by the viewer loop; `remote.py` sends the torch and exposure-lock toggles to DroidCam.
 
 ## Tests
 
@@ -66,7 +84,7 @@ Webcams cannot be synchronized in hardware, so the viewer measures how far apart
 pytest
 ```
 
-The tests cover pairing, flash detection, the capture buffer and the viewer's trial logic, all with fake cameras.
+The tests cover pairing, flash detection, the capture buffer, the trial logic and the torch batch, all with fake cameras and a fake phone.
 
 ## License
 

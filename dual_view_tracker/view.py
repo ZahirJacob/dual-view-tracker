@@ -1,7 +1,8 @@
 """Live side-by-side viewer for two cameras with a flash sync test.
 
 Run: python -m dual_view_tracker.view
-Keys: f = arm a 3 s flash trial, q or Esc = quit.
+Keys: f = arm a 3 s flash trial, t = run an automated torch batch (needs
+--remote), q or Esc = quit.
 """
 
 from __future__ import annotations
@@ -15,19 +16,20 @@ import cv2
 import numpy as np
 
 from dual_view_tracker.capture import CameraConfig, CameraStream, parse_source
-from dual_view_tracker.flash import (
-    BrightnessSample,
-    find_flash_onset,
-    largest_rise,
-    mean_brightness,
-    summarize_offsets,
-)
+from dual_view_tracker.flash import summarize_offsets
+from dual_view_tracker.remote import DroidCamRemote
 from dual_view_tracker.sync import FramePair, FramePairer
+from dual_view_tracker.trials import (
+    FLASH_MIN_JUMP,
+    FlashTrial,
+    TorchBatch,
+    TrialResult,
+    format_trial_result,
+    write_torch_csv,
+)
 
 BACKENDS = {"msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW}
 FLASH_TRIAL_SECONDS = 3.0
-# Brightness is 0..255; a camera flash on a normal room easily exceeds this.
-FLASH_MIN_JUMP = 20.0
 STARTUP_CHECK_SECONDS = 1.0
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.6
@@ -41,6 +43,16 @@ def parse_resolution(text: str) -> tuple[int, int]:
         return int(width), int(height)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected WxH, got {text!r}")
+
+
+def positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {text!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected a number of 1 or more, got {value}")
+    return value
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -61,63 +73,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--min-jump", type=float, default=FLASH_MIN_JUMP,
         help="smallest brightness rise (0-255) that counts as the flash",
     )
+    parser.add_argument(
+        "--remote", metavar="BASE_URL", default=None,
+        help="DroidCam remote control base, e.g. http://192.168.0.20:4747;"
+        " enables the torch batch (key t)",
+    )
+    parser.add_argument(
+        "--trials", type=positive_int, default=20, help="flashes per torch batch"
+    )
     return parser.parse_args(argv)
-
-
-class FlashTrial:
-    """Collects one brightness sample per new frame on each stream while armed."""
-
-    def __init__(
-        self,
-        streams: list[CameraStream],
-        duration: float,
-        started_at: float,
-        min_jump: float = FLASH_MIN_JUMP,
-    ):
-        self.streams = streams
-        self.min_jump = min_jump
-        self.ends_at = started_at + duration
-        self.samples: list[list[BrightnessSample]] = [[] for _ in streams]
-        self.last_index = [-1] * len(streams)
-        # Frames evicted from the ring buffer before we sampled them (the main
-        # loop stalls when the window is dragged, for example). A missed frame
-        # around the flash makes the onset timestamp unreliable.
-        self.missed = [0] * len(streams)
-
-    def collect(self) -> None:
-        for i, stream in enumerate(self.streams):
-            for frame in stream.frames():
-                if frame.index <= self.last_index[i]:
-                    continue
-                if self.last_index[i] >= 0:
-                    self.missed[i] += frame.index - self.last_index[i] - 1
-                self.last_index[i] = frame.index
-                self.samples[i].append(
-                    BrightnessSample(frame.timestamp, mean_brightness(frame.image))
-                )
-
-    def finished(self, now: float) -> bool:
-        return now >= self.ends_at
-
-    def offset(self) -> float | None:
-        """Camera 1 onset minus camera 0 onset; positive means camera 1 saw the flash later."""
-        onsets = [find_flash_onset(s, self.min_jump) for s in self.samples]
-        if any(onset is None for onset in onsets):
-            return None
-        return onsets[1] - onsets[0]
-
-    def rise_summary(self) -> str:
-        """Largest brightness rise seen per camera, so a missed flash can be diagnosed."""
-        parts = []
-        for i, samples in enumerate(self.samples):
-            jump, _ = largest_rise(samples)
-            parts.append(f"cam{i} rise {jump:.1f} in {len(samples)} frames")
-        return f"largest rise (need {self.min_jump:g}): " + ", ".join(parts)
-
-    def missed_summary(self) -> str:
-        total = sum(self.missed)
-        per_camera = ", ".join(f"cam{i} {n}" for i, n in enumerate(self.missed))
-        return f"{total} frames missed ({per_camera})"
 
 
 def scaled_to_height(image: np.ndarray, height: int) -> np.ndarray:
@@ -141,7 +105,7 @@ def compose(
     streams: list[CameraStream],
     display_height: int,
     offsets: list[float],
-    trial_armed: bool,
+    prompt: str | None,
 ) -> np.ndarray:
     panels = []
     # Label panels by position, not by source: a stream URL would not fit.
@@ -171,9 +135,14 @@ def compose(
         10,
         display_height - 15,
     )
-    if trial_armed:
-        put_text(canvas, "FLASH TRIAL: fire the flash now", 10, PROMPT_Y, (0, 255, 255))
+    if prompt:
+        put_text(canvas, prompt, 10, PROMPT_Y, (0, 255, 255))
     return canvas
+
+
+def batch_prompt(batch: TorchBatch) -> str:
+    mean = summarize_offsets(batch.offsets())["mean"]
+    return f"TORCH BATCH trial {batch.trial_number}/{batch.trials}  mean {mean * 1000:+.1f} ms"
 
 
 def print_settings(position: int, stream: CameraStream, requested: CameraConfig) -> None:
@@ -200,6 +169,75 @@ def print_silent_streams(streams: list[CameraStream], after_seconds: float) -> N
             )
 
 
+def print_flash_trial(trial: FlashTrial, number: int, offset: float | None) -> None:
+    if offset is None:
+        print(
+            "flash trial: flash not detected on both cameras;"
+            f" {trial.rise_summary()}; {trial.missed_summary()}"
+        )
+    else:
+        print(
+            f"flash trial {number}: offset {offset * 1000:+.2f} ms"
+            f" (cam1 minus cam0); {trial.rise_summary()}; {trial.missed_summary()}"
+        )
+
+
+def format_stats(offsets: list[float]) -> str:
+    stats = summarize_offsets(offsets)
+    return (
+        f"mean {stats['mean'] * 1000:+.2f} ms, std {stats['std'] * 1000:.2f} ms,"
+        f" min {stats['min'] * 1000:+.2f} ms, max {stats['max'] * 1000:+.2f} ms"
+    )
+
+
+def print_torch_summary(results: list[TrialResult]) -> None:
+    # A slow camera makes the onset coarse, so slow trials stay out of the
+    # statistics; they are still in the CSV with their flag.
+    detected = [r for r in results if r.offset is not None]
+    valid = [r.offset for r in detected if not r.slow]
+    print(
+        f"torch offsets (cam1 minus cam0): count {len(valid)} valid"
+        f" ({len(detected) - len(valid)} slow excluded,"
+        f" {len(results) - len(detected)} not detected), {format_stats(valid)}"
+    )
+
+
+def finish_batch(batch: TorchBatch, torch_results: list[TrialResult]) -> None:
+    """Keep the finished trials and reset the phone; a failed reset is printed
+    so the viewer keeps running and the operator can fix the phone by hand."""
+    torch_results.extend(batch.results)
+    try:
+        batch.abort()
+    except RuntimeError as error:
+        print(f"torch batch: could not reset the phone: {error}")
+
+
+def advance_batch(
+    batch: TorchBatch, now: float, torch_results: list[TrialResult], min_jump: float
+) -> TorchBatch | None:
+    """One step of the batch; None once it is over and its results were
+    moved to `torch_results`. Trials are numbered across batches to match
+    the CSV rows."""
+    reported = len(batch.results)
+    try:
+        batch.update(now)
+    except RuntimeError as error:
+        print(f"torch batch stopped: {error}")
+        finish_batch(batch, torch_results)
+        return None
+    for number in range(reported + 1, len(batch.results) + 1):
+        print(
+            format_trial_result(
+                len(torch_results) + number, batch.results[number - 1], min_jump
+            )
+        )
+    if batch.finished:
+        torch_results.extend(batch.results)
+        print("torch batch done")
+        return None
+    return batch
+
+
 def write_offsets_csv(path: Path, offsets: list[float]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
@@ -217,9 +255,12 @@ def main(argv: list[str] | None = None) -> None:
         CameraConfig(args.cam1, *args.res1, fps=args.fps, backend=backend),
     ]
     streams = [CameraStream(config) for config in configs]
+    remote = DroidCamRemote(args.remote) if args.remote else None
     pairer = FramePairer(max_wait=args.max_wait)
     offsets: list[float] = []
+    torch_results: list[TrialResult] = []
     trial: FlashTrial | None = None
+    batch: TorchBatch | None = None
     window = "dual-view-tracker"
 
     try:
@@ -239,43 +280,47 @@ def main(argv: list[str] | None = None) -> None:
                 trial.collect()
                 if trial.finished(now):
                     offset = trial.offset()
-                    if offset is None:
-                        print(
-                            "flash trial: flash not detected on both cameras;"
-                            f" {trial.rise_summary()}; {trial.missed_summary()}"
-                        )
-                    else:
+                    if offset is not None:
                         offsets.append(offset)
-                        print(
-                            f"flash trial {len(offsets)}: offset {offset * 1000:+.2f} ms"
-                            f" (cam1 minus cam0); {trial.rise_summary()}; {trial.missed_summary()}"
-                        )
+                    print_flash_trial(trial, len(offsets), offset)
                     trial = None
+
+            if batch is not None:
+                batch = advance_batch(batch, now, torch_results, args.min_jump)
 
             pair = pairer.pair(streams[0].frames(), streams[1].frames(), now)
             if pair is not None:
-                cv2.imshow(
-                    window,
-                    compose(pair, streams, args.display_height, offsets, trial is not None),
-                )
+                if batch is not None:
+                    prompt = batch_prompt(batch)
+                elif trial is not None:
+                    prompt = "FLASH TRIAL: fire the flash now"
+                else:
+                    prompt = None
+                cv2.imshow(window, compose(pair, streams, args.display_height, offsets, prompt))
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key == ord("f") and trial is None:
+            if key == ord("f") and trial is None and batch is None:
                 trial = FlashTrial(streams, FLASH_TRIAL_SECONDS, now, args.min_jump)
                 print("flash trial armed: fire the flash now")
+            if key == ord("t") and trial is None and batch is None:
+                if remote is None:
+                    print("torch batch needs --remote BASE_URL (the DroidCam remote control)")
+                else:
+                    try:
+                        batch = TorchBatch(streams, remote, args.trials, args.min_jump, now)
+                        print(f"torch batch started: {args.trials} trials")
+                    except RuntimeError as error:
+                        print(f"torch batch could not start: {error}")
     finally:
+        if batch is not None:
+            finish_batch(batch, torch_results)
         for stream in streams:
             stream.stop()
         cv2.destroyAllWindows()
 
-    stats = summarize_offsets(offsets)
-    print(
-        f"flash offsets (cam1 minus cam0): count {stats['count']},"
-        f" mean {stats['mean'] * 1000:+.2f} ms, std {stats['std'] * 1000:.2f} ms,"
-        f" min {stats['min'] * 1000:+.2f} ms, max {stats['max'] * 1000:+.2f} ms"
-    )
+    print(f"flash offsets (cam1 minus cam0): count {len(offsets)}, {format_stats(offsets)}")
     for i, stream in enumerate(streams):
         print(
             f"cam {i}: measured {stream.measured_fps():.1f} fps,"
@@ -284,6 +329,11 @@ def main(argv: list[str] | None = None) -> None:
     if offsets:
         path = Path("output") / "flash_offsets.csv"
         write_offsets_csv(path, offsets)
+        print(f"wrote {path}")
+    if torch_results:
+        print_torch_summary(torch_results)
+        path = Path("output") / "torch_offsets.csv"
+        write_torch_csv(path, torch_results)
         print(f"wrote {path}")
 
 
