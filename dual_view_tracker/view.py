@@ -14,10 +14,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from dual_view_tracker.capture import CameraConfig, CameraStream
+from dual_view_tracker.capture import CameraConfig, CameraStream, parse_source
 from dual_view_tracker.flash import (
     BrightnessSample,
     find_flash_onset,
+    largest_rise,
     mean_brightness,
     summarize_offsets,
 )
@@ -44,22 +45,37 @@ def parse_resolution(text: str) -> tuple[int, int]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--cam0", type=int, default=0, help="reference camera index")
-    parser.add_argument("--cam1", type=int, default=1, help="other camera index")
+    parser.add_argument(
+        "--cam0", type=parse_source, default=0, help="reference camera index or stream URL"
+    )
+    parser.add_argument(
+        "--cam1", type=parse_source, default=1, help="other camera index or stream URL"
+    )
     parser.add_argument("--res0", type=parse_resolution, default="1280x720", metavar="WxH")
     parser.add_argument("--res1", type=parse_resolution, default="1920x1080", metavar="WxH")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--backend", choices=sorted(BACKENDS), default="msmf")
     parser.add_argument("--max-wait", type=float, default=0.1, help="seconds")
     parser.add_argument("--display-height", type=int, default=480)
+    parser.add_argument(
+        "--min-jump", type=float, default=FLASH_MIN_JUMP,
+        help="smallest brightness rise (0-255) that counts as the flash",
+    )
     return parser.parse_args(argv)
 
 
 class FlashTrial:
     """Collects one brightness sample per new frame on each stream while armed."""
 
-    def __init__(self, streams: list[CameraStream], duration: float, started_at: float):
+    def __init__(
+        self,
+        streams: list[CameraStream],
+        duration: float,
+        started_at: float,
+        min_jump: float = FLASH_MIN_JUMP,
+    ):
         self.streams = streams
+        self.min_jump = min_jump
         self.ends_at = started_at + duration
         self.samples: list[list[BrightnessSample]] = [[] for _ in streams]
         self.last_index = [-1] * len(streams)
@@ -85,10 +101,18 @@ class FlashTrial:
 
     def offset(self) -> float | None:
         """Camera 1 onset minus camera 0 onset; positive means camera 1 saw the flash later."""
-        onsets = [find_flash_onset(s, FLASH_MIN_JUMP) for s in self.samples]
+        onsets = [find_flash_onset(s, self.min_jump) for s in self.samples]
         if any(onset is None for onset in onsets):
             return None
         return onsets[1] - onsets[0]
+
+    def rise_summary(self) -> str:
+        """Largest brightness rise seen per camera, so a missed flash can be diagnosed."""
+        parts = []
+        for i, samples in enumerate(self.samples):
+            jump, _ = largest_rise(samples)
+            parts.append(f"cam{i} rise {jump:.1f} in {len(samples)} frames")
+        return f"largest rise (need {self.min_jump:g}): " + ", ".join(parts)
 
     def missed_summary(self) -> str:
         total = sum(self.missed)
@@ -120,12 +144,13 @@ def compose(
     trial_armed: bool,
 ) -> np.ndarray:
     panels = []
-    for stream, frame in zip(streams, (pair.reference, pair.other)):
+    # Label panels by position, not by source: a stream URL would not fit.
+    for i, (stream, frame) in enumerate(zip(streams, (pair.reference, pair.other))):
         panel = scaled_to_height(frame.image, display_height)
         settings = stream.actual_settings()
         put_text(
             panel,
-            f"cam {stream.config.device}  {settings['width']}x{settings['height']}"
+            f"cam {i}  {settings['width']}x{settings['height']}"
             f"  {stream.measured_fps():.1f} fps",
             10,
             LABEL_Y,
@@ -151,20 +176,26 @@ def compose(
     return canvas
 
 
-def print_settings(stream: CameraStream, requested: CameraConfig) -> None:
+def print_settings(position: int, stream: CameraStream, requested: CameraConfig) -> None:
     actual = stream.actual_settings()
+    if isinstance(requested.device, str):
+        request = "requested stream"
+    else:
+        request = (
+            f"requested {requested.width}x{requested.height}"
+            f" @ {requested.fps} {requested.fourcc}"
+        )
     print(
-        f"cam {requested.device}: requested {requested.width}x{requested.height}"
-        f" @ {requested.fps} {requested.fourcc}, actual {actual['width']}x{actual['height']}"
-        f" @ {actual['fps']:g} {actual['fourcc']}"
+        f"cam {position} ({requested.device}): {request},"
+        f" actual {actual['width']}x{actual['height']} @ {actual['fps']:g} {actual['fourcc']}"
     )
 
 
 def print_silent_streams(streams: list[CameraStream], after_seconds: float) -> None:
-    for stream in streams:
+    for i, stream in enumerate(streams):
         if stream.latest() is None:
             print(
-                f"cam {stream.config.device}: no frames after {after_seconds:g} s"
+                f"cam {i}: no frames after {after_seconds:g} s"
                 f" ({stream.dropped_frames} dropped); the camera opened but is not delivering yet"
             )
 
@@ -192,9 +223,9 @@ def main(argv: list[str] | None = None) -> None:
     window = "dual-view-tracker"
 
     try:
-        for stream, config in zip(streams, configs):
+        for i, (stream, config) in enumerate(zip(streams, configs)):
             stream.start()
-            print_settings(stream, config)
+            print_settings(i, stream, config)
         started_at = time.perf_counter()
         startup_checked = False
 
@@ -209,12 +240,15 @@ def main(argv: list[str] | None = None) -> None:
                 if trial.finished(now):
                     offset = trial.offset()
                     if offset is None:
-                        print(f"flash trial: flash not detected on both cameras; {trial.missed_summary()}")
+                        print(
+                            "flash trial: flash not detected on both cameras;"
+                            f" {trial.rise_summary()}; {trial.missed_summary()}"
+                        )
                     else:
                         offsets.append(offset)
                         print(
                             f"flash trial {len(offsets)}: offset {offset * 1000:+.2f} ms"
-                            f" (cam1 minus cam0); {trial.missed_summary()}"
+                            f" (cam1 minus cam0); {trial.rise_summary()}; {trial.missed_summary()}"
                         )
                     trial = None
 
@@ -229,7 +263,7 @@ def main(argv: list[str] | None = None) -> None:
             if key in (ord("q"), 27):
                 break
             if key == ord("f") and trial is None:
-                trial = FlashTrial(streams, FLASH_TRIAL_SECONDS, now)
+                trial = FlashTrial(streams, FLASH_TRIAL_SECONDS, now, args.min_jump)
                 print("flash trial armed: fire the flash now")
     finally:
         for stream in streams:
@@ -242,9 +276,9 @@ def main(argv: list[str] | None = None) -> None:
         f" mean {stats['mean'] * 1000:+.2f} ms, std {stats['std'] * 1000:.2f} ms,"
         f" min {stats['min'] * 1000:+.2f} ms, max {stats['max'] * 1000:+.2f} ms"
     )
-    for stream in streams:
+    for i, stream in enumerate(streams):
         print(
-            f"cam {stream.config.device}: measured {stream.measured_fps():.1f} fps,"
+            f"cam {i}: measured {stream.measured_fps():.1f} fps,"
             f" {stream.dropped_frames} dropped frames"
         )
     if offsets:

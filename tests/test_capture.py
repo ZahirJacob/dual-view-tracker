@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from dual_view_tracker.capture import CameraConfig, CameraStream, decode_fourcc
+from dual_view_tracker.capture import CameraConfig, CameraStream, decode_fourcc, parse_source
 
 
 class FakeCapture:
@@ -52,9 +52,9 @@ def wait_until(condition, timeout=2.0):
         time.sleep(0.005)
 
 
-def make_stream(fps=30, history_seconds=0.1):
+def make_stream(fps=30, history_seconds=0.1, device=0):
     fake = FakeCapture()
-    stream = CameraStream(CameraConfig(0, 4, 4, fps=fps), history_seconds, capture=fake)
+    stream = CameraStream(CameraConfig(device, 4, 4, fps=fps), history_seconds, capture=fake)
     return stream, fake
 
 
@@ -123,11 +123,30 @@ def test_start_applies_requested_settings():
     assert decode_fourcc(fake.props[cv2.CAP_PROP_FOURCC]) == "MJPG"
 
 
+def test_start_on_stream_url_requests_nothing_but_buffer_size():
+    stream, fake = make_stream(fps=15, device="http://x:4747/video")
+    stream.start()
+    stream.stop()
+    assert fake.props == {cv2.CAP_PROP_BUFFERSIZE: 1}
+
+
 def test_start_fails_on_closed_capture():
     stream, fake = make_stream()
     fake.released = True
-    with pytest.raises(RuntimeError, match="device 0"):
+    with pytest.raises(RuntimeError, match="source 0"):
         stream.start()
+
+
+def test_start_fails_on_closed_stream_url():
+    stream, fake = make_stream(device="http://x:4747/video")
+    fake.released = True
+    with pytest.raises(RuntimeError, match="source http://x:4747/video"):
+        stream.start()
+
+
+def test_parse_source():
+    assert parse_source("1") == 1
+    assert parse_source("http://x:4747/video") == "http://x:4747/video"
 
 
 def test_failed_grabs_are_counted_and_capture_continues():

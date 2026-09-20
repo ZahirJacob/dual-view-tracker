@@ -20,11 +20,11 @@ class BrightnessSample:
     value: float
 
 
-def find_flash_onset(samples: list[BrightnessSample], min_jump: float) -> float | None:
-    """Timestamp of the largest brightness rise between consecutive samples,
-    or None if that rise is below `min_jump` or there are fewer than 2 samples."""
+def largest_rise(samples: list[BrightnessSample]) -> tuple[float, float | None]:
+    """(size, timestamp) of the largest brightness rise between consecutive
+    samples; (0.0, None) with fewer than 2 samples."""
     if len(samples) < 2:
-        return None
+        return 0.0, None
     best_index = 1
     best_jump = samples[1].value - samples[0].value
     for i in range(2, len(samples)):
@@ -32,9 +32,15 @@ def find_flash_onset(samples: list[BrightnessSample], min_jump: float) -> float 
         if jump > best_jump:
             best_jump = jump
             best_index = i
-    if best_jump < min_jump:
+    return best_jump, samples[best_index].timestamp
+
+
+def find_flash_onset(samples: list[BrightnessSample], min_jump: float) -> float | None:
+    """Timestamp of the largest brightness rise, or None if it is below `min_jump`."""
+    jump, timestamp = largest_rise(samples)
+    if timestamp is None or jump < min_jump:
         return None
-    return samples[best_index].timestamp
+    return timestamp
 
 
 def summarize_offsets(offsets: list[float]) -> dict:

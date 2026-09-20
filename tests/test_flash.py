@@ -3,6 +3,7 @@ import numpy as np
 from dual_view_tracker.flash import (
     BrightnessSample,
     find_flash_onset,
+    largest_rise,
     mean_brightness,
     summarize_offsets,
 )
@@ -95,3 +96,18 @@ def test_mean_brightness_averages_colour_channels():
     image[..., 1] = 90
     image[..., 2] = 210
     assert mean_brightness(image) == 100.0
+
+
+def test_largest_rise_reports_size_and_timestamp():
+    samples = [
+        BrightnessSample(1.0, 10.0),
+        BrightnessSample(1.1, 12.0),
+        BrightnessSample(1.2, 40.0),
+        BrightnessSample(1.3, 41.0),
+    ]
+    assert largest_rise(samples) == (28.0, 1.2)
+
+
+def test_largest_rise_with_too_few_samples():
+    assert largest_rise([]) == (0.0, None)
+    assert largest_rise([BrightnessSample(1.0, 5.0)]) == (0.0, None)

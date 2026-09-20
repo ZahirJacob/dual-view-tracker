@@ -14,7 +14,7 @@ Two-camera capture with timestamps, frame pairing and a flash-based synchronizat
 
 - Windows 10/11 (cameras are read through Media Foundation or DirectShow)
 - Python 3.12 or newer
-- Two USB webcams
+- Two USB webcams, or one webcam plus a phone that serves a video stream
 
 ## Install
 
@@ -38,17 +38,25 @@ Open both cameras and show them side by side:
 python -m dual_view_tracker.view --cam0 0 --cam1 1 --res0 1280x720 --res1 1920x1080
 ```
 
-Those values are the defaults. Other options: `--fps` (30), `--backend msmf|dshow` (msmf), `--max-wait` seconds before pairing an unmatched frame (0.1), `--display-height` pixels (480).
+Those values are the defaults. Other options: `--fps` (30), `--backend msmf|dshow` (msmf), `--max-wait` seconds before pairing an unmatched frame (0.1), `--display-height` pixels (480), `--min-jump` smallest brightness rise, on a 0-255 scale, that counts as the flash (20).
+
+`--cam0` and `--cam1` take a device index or a video stream URL. A phone running a camera app that serves a video stream over the network (DroidCam, for example) can be the second camera:
+
+```powershell
+python -m dual_view_tracker.view --cam0 0 --cam1 http://192.168.0.20:4747/video
+```
+
+For a stream, the phone decides the resolution and frame rate, so `--res1` is ignored for it.
 
 On start, the viewer prints the requested and actual settings of each camera. The overlay shows each camera's real resolution and measured frame rate, and the time gap between the two frames currently paired, marked `settled` or `UNSETTLED`. Press `q` or Esc to quit.
 
 ### Synchronization test
 
-Webcams cannot be synchronized in hardware, so the viewer measures how far apart the two cameras are in time. Point a phone flash so both cameras see it, press `f`, and fire the flash within three seconds. The viewer finds the frame where brightness jumps in each camera and reports the difference (camera 1 minus camera 0, so a positive value means camera 1 saw the flash later). If the jump is too small on either camera, the trial is discarded. Repeat a few times; the mean and spread are shown on screen, printed on exit, and written to `output/flash_offsets.csv` if at least one trial succeeded.
+Webcams cannot be synchronized in hardware, so the viewer measures how far apart the two cameras are in time. Point a phone flash so both cameras see it, press `f`, and fire the flash within three seconds. The viewer finds the frame where brightness jumps in each camera and reports the difference (camera 1 minus camera 0, so a positive value means camera 1 saw the flash later). If the rise is smaller than `--min-jump` on either camera, the trial is discarded; each trial prints the largest rise seen per camera, so a missed flash can be diagnosed. Repeat a few times; the mean and spread are shown on screen, printed on exit, and written to `output/flash_offsets.csv` if at least one trial succeeded.
 
 ## How it works
 
-- `capture.py` reads each camera in its own thread and keeps the last half second of frames, each stamped with its arrival time.
+- `capture.py` reads each camera in its own thread and keeps the last half second of frames, each stamped with its arrival time. A stream URL is read through FFmpeg.
 - `sync.py` pairs the newest frame of the reference camera with the closest frame of the other camera. It waits until the other camera has a frame at or after the reference frame, so no later frame can be a better match. This costs at most one frame period of latency. If the other camera stalls for longer than `--max-wait`, the pair is made anyway and marked unsettled.
 - `flash.py` finds the flash onset as the largest brightness rise between consecutive frames.
 
